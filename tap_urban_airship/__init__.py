@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 
-import datetime
+from datetime import datetime
+import dateutil.parser
 import os
 import sys
+import json
 
 import backoff
 import requests
 import singer
 from singer import utils
+from singer.catalog import Catalog, CatalogEntry
+from singer.schema import Schema
 
 from .transform import transform_row
 
+AIRSHIP_DATE_FORMAT = '%Y-%m-%d %H:%M'
 
 BASE_URL = "https://go.urbanairship.com/api/"
 CONFIG = {
     'app_key': None,
     'app_secret': None,
-    'start_date': None,
+    'start_date': None
 }
 STATE = {}
+
+ENDPOINTS = {'channels':'channels', 'lists':'lists', 'named_users':'named_users', 'segments':'segments', 'pushes':'reports/responses/list'}
 
 LOGGER = singer.get_logger()
 SESSION = requests.Session()
@@ -36,19 +43,47 @@ def get_start(entity):
 
     return STATE[entity]
 
+
+def discover():
+    streams = []
+    for key in ENDPOINTS.keys():
+        raw_schema = load_schema(key)
+        # for stream_id, schema in raw_schemas.items():
+        # TODO: populate any metadata and stream's key properties here..
+        stream_metadata = [{'breadcrumb':[], 'metadata':{'selected':True}}]
+        key_properties = []
+        streams.append(
+            CatalogEntry(
+                tap_stream_id=key,
+                stream=key,
+                schema=Schema.from_dict(raw_schema),
+                key_properties=key_properties,
+                metadata=stream_metadata,
+                replication_key=None,
+                is_view=None,
+                database=None,
+                table=None,
+                row_count=None,
+                stream_alias=None,
+                replication_method=None,
+            )
+        )
+    
+    return Catalog(streams)
+
 @backoff.on_exception(backoff.expo,
                       (requests.exceptions.RequestException),
                       max_tries=5,
                       giveup=lambda e: e.response is not None \
                           and 400 <= e.response.status_code < 500,
                       factor=2)
-def request(url):
+def request(url, params):
     auth = requests.auth.HTTPBasicAuth(CONFIG['app_key'], CONFIG['app_secret'])
     headers = {'Accept': "application/vnd.urbanairship+json; version=3;"}
     if 'user_agent' in CONFIG:
         headers['User-Agent'] = CONFIG['user_agent']
 
-    req = requests.Request('GET', url, auth=auth, headers=headers).prepare()
+    req = requests.Request('GET', url, params=params, auth=auth, headers=headers).prepare()
     LOGGER.info("GET {}".format(req.url))
     resp = SESSION.send(req)
     if resp.status_code >= 400:
@@ -64,12 +99,13 @@ def request(url):
     return resp
 
 
-def gen_request(endpoint):
+def gen_request(entity, params):
+    endpoint = ENDPOINTS[entity]
     url = BASE_URL + endpoint
     while url:
-        resp = request(url)
+        resp = request(url, params=params)
         data = resp.json()
-        for row in data[endpoint]:
+        for row in data[entity]:
             yield row
 
         url = data.get('next_page')
@@ -80,7 +116,11 @@ def sync_entity(entity, primary_keys, date_keys=None, transform=None):
     singer.write_schema(entity, schema, primary_keys)
 
     start_date = get_start(entity)
-    for row in gen_request(entity):
+    params = None
+    if entity == 'pushes':
+        params = {'start':dateutil.parser.parse(start_date).strftime(AIRSHIP_DATE_FORMAT), 'end': datetime.now().strftime(AIRSHIP_DATE_FORMAT)}
+
+    for row in gen_request(entity, params=params):
         if transform:
             row = transform(row)
 
@@ -111,28 +151,31 @@ def sync_entity(entity, primary_keys, date_keys=None, transform=None):
     singer.write_state(STATE)
 
 
-def do_sync():
+# Named Users have full channel objects nested in them. We only need the
+# ids for generating the join table, so we transform the list of channel
+# objects into a list of channel ids before transforming the row based on
+# the schema.
+def flatten_channels(item):
+    item['channels'] = [c['channel_id'] for c in item['channels']]
+    return item
+
+def do_sync(config, state, catalog):
     LOGGER.info("Starting sync")
 
-    # Lists, Channels, and Segments are very straight forward to sync. They
-    # each have two dates that need to be examined to determine the last time
-    # the record was touched.
-    sync_entity("lists", ["name"], ["created", "last_updated"])
-    sync_entity("channels", ["channel_id"], ["created", "last_registration"])
-    sync_entity("segments", ["id"], ["creation_date", "modificiation_date"])
+    stream_props = {
+        'lists': {'primary_key': 'name', 'date_keys':['created', 'last_updated'], 'transform_func':None},
+        'channels': {'primary_key': 'channel_id', 'date_keys':['created', 'last_registration'], 'transform_func':None},
+        'segments': {'primary_key': 'id', 'date_keys':['creation_date', 'modificiation_date'], 'transform_func':None},
+        'named_users': {'primary_key': 'named_user_id', 'date_keys':['created', 'last_modified'], 'transform_func':flatten_channels},
+        'pushes': {'primary_key': 'push_uuid', 'date_keys':['push_time'], 'transform_func':None},
+        }
 
-    # Named Users have full channel objects nested in them. We only need the
-    # ids for generating the join table, so we transform the list of channel
-    # objects into a list of channel ids before transforming the row based on
-    # the schema.
-    def flatten_channels(item):
-        item['channels'] = [c['channel_id'] for c in item['channels']]
-        return item
+    for stream in catalog.get_selected_streams(state):
+        stream_id = stream.tap_stream_id
 
-    # The date fields are not described in API documentation
-    # https://docs.urbanairship.com/api/ua/#schemas/nameduserresponsebody,
-    # but actually they are present.
-    sync_entity("named_users", ["named_user_id"], ["created", "last_modified"], transform=flatten_channels)
+        LOGGER.info("Syncing stream:" + stream_id)
+
+        sync_entity(stream_id, stream_props[stream_id]['primary_key'], stream_props[stream_id]['date_keys'], stream_props[stream_id]['transform_func'])
 
     LOGGER.info("Sync completed")
 
@@ -141,10 +184,19 @@ def main_impl():
     args = utils.parse_args(["app_key", "app_secret", "start_date"])
     CONFIG.update(args.config)
 
-    if args.state:
-        STATE.update(args.state)
+    if args.discover:
+        catalog = discover()
+        catalog.dump()
+    else:
+        if args.catalog:
+            catalog = args.catalog
+        else:
+            catalog = discover()
+        
+        if args.state:
+            STATE.update(args.state)
 
-    do_sync()
+        do_sync(args.config, args.state, catalog)
 
 def main():
     try:

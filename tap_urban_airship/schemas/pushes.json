@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "properties": {
+    "push_uuid": {
+      "type": "string"
+    },
+    "push_type": {
+      "type": ["string", "null"]
+    },
+    "push_time": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "sends": {
+      "type": ["integer", "null"]
+    },
+    "direct_responses": {
+      "type": ["integer", "null"]
+    }
+  }
+}

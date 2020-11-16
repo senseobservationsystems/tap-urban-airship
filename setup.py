@@ -3,16 +3,16 @@
 from setuptools import setup
 
 setup(name='tap-urban-airship',
-      version='0.9.0',
+      version='0.10.0',
       description='Singer.io tap for extracting data from the Urban Airship API',
       author='Stitch',
       url='http://singer.io',
       classifiers=['Programming Language :: Python :: 3 :: Only'],
       py_modules=['tap_urban_airship'],
       install_requires=[
-          'singer-python==1.2.0',
+          'singer-python>=1.2.0',
           'requests==2.20.0',
-          'backoff==1.3.2'
+          'backoff==1.8.0'
       ],
       entry_points='''
           [console_scripts]
@@ -25,6 +25,7 @@ setup(name='tap-urban-airship',
             "lists.json",
             "named_users.json",
             "segments.json",
+            "pushes.json"
           ],
       },
       include_package_data=True,
